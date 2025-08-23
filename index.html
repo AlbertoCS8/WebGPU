@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>WebGPU — Enjambre de partículas interactivo</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b1020;color:#dde}
+    canvas{display:block;width:100%;height:100vh}
+    #overlay{position:fixed;left:12px;top:12px;background:rgba(0,0,0,0.4);padding:8px 10px;border-radius:8px;font-family:system-ui,Arial;font-size:13px}
+  </style>
+</head>
+<body>
+  <div id="overlay">Mueve el ratón / toca la pantalla — actual: <span id="count">0</span> partículas</div>
+  <canvas id="c"></canvas>
+  <script type="module">
+    const canvas = document.getElementById('c');
+    const overlayCount = document.getElementById('count');
+
+    // Parámetros
+    const NUM = 12000; // número de partículas
+    const PARTICLE_SIZE = 2.0; // tamaño en píxeles (se controla en vertex)
+
+    // Estado del ratón (en coordenadas clip-space: -1..1)
+    let mouse = { x: 2.0, y: 2.0, pressed: 0.0 };
+
+    // Detectar soporte WebGPU
+    if (!navigator.gpu) {
+      document.body.innerHTML = '<div style="padding:24px;color:#ffdcdc;font-family:system-ui;">Tu navegador no soporta WebGPU. Prueba Chrome/Edge Canary o activa WebGPU.\n</div>';
+      throw new Error('No WebGPU');
+    }
+
+    // Inicialización asíncrona
+    async function init() {
+      const adapter = await navigator.gpu.requestAdapter();
+      const device = await adapter.requestDevice();
+      const context = canvas.getContext('webgpu');
+
+      // Formato de swap chain
+      const format = navigator.gpu.getPreferredCanvasFormat();
+      context.configure({ device, format, alphaMode: 'opaque' });
+
+      // Buffers: cada partícula -> vec4<f32> : x, y, vx, vy
+      const particleArray = new Float32Array(NUM * 4);
+      for (let i = 0; i < NUM; i++) {
+        const idx = i * 4;
+        // posición inicial en -1..1
+        particleArray[idx + 0] = (Math.random() * 2 - 1) * 0.98;
+        particleArray[idx + 1] = (Math.random() * 2 - 1) * 0.98;
+        // velocidad pequeña
+        particleArray[idx + 2] = (Math.random() * 2 - 1) * 0.0015;
+        particleArray[idx + 3] = (Math.random() * 2 - 1) * 0.0015;
+      }
+
+      const particleBuffer = device.createBuffer({
+        size: particleArray.byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        mappedAtCreation: true,
+      });
+      new Float32Array(particleBuffer.getMappedRange()).set(particleArray);
+      particleBuffer.unmap();
+
+      // Uniform buffer para parámetros (mouse + dt + screen aspect)
+      const uniformBufferSize = 4 * 4; // 4 floats
+      const uniformBuffer = device.createBuffer({
+        size: uniformBufferSize,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      });
+
+      // Compute shader (WGSL) para actualizar partículas
+      const computeShader = `
+struct Part { pos : vec2<f32>, vel : vec2<f32> };
+@group(0) @binding(0) var<storage, read_write> parts : array<Part>;
+@group(0) @binding(1) var<uniform> u : vec4<f32>; // mouse.x, mouse.y, dt, strength
+
+@compute @workgroup_size(128)
+fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+  let i = id.x;
+  if (i >= arrayLength(&parts)) { return; }
+  var p = parts[i];
+
+  let mousePos = vec2<f32>(u.x, u.y);
+  let dt = u.z;
+  let strength = u.w;
+
+  // vector desde partícula hacia ratón
+  var dir = mousePos - p.pos;
+  let dist2 = max(dot(dir,dir), 0.0001);
+  let invDist = 1.0 / sqrt(dist2);
+  dir = dir * invDist; // normalize
+
+  // aplicación de fuerza (atracción/repulsión según sign de strength)
+  let force = dir * (strength / dist2) * dt;
+  p.vel = p.vel + force;
+
+  // pequeña fricción
+  p.vel = p.vel * 0.995;
+
+  // mover
+  p.pos = p.pos + p.vel * dt * 1.0; // escala para sentirlo bien
+
+  // wrap-around
+  if (p.pos.x > 1) { p.pos.x = -1; }
+  if (p.pos.x < -1) { p.pos.x = 1; }
+  if (p.pos.y > 1) { p.pos.y = -1; }
+  if (p.pos.y < -1) { p.pos.y = 1; }
+
+  parts[i] = p;
+}
+`;
+
+      const computeModule = device.createShaderModule({ code: computeShader });
+
+      const computePipeline = device.createComputePipeline({
+        layout: 'auto',
+        compute: { module: computeModule, entryPoint: 'main' }
+      });
+
+      // Bind group para compute (particle storage + uniforms)
+      const computeBindGroup = device.createBindGroup({
+        layout: computePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: particleBuffer } },
+          { binding: 1, resource: { buffer: uniformBuffer } },
+        ]
+      });
+
+      // Vertex + fragment shader (render simple puntos)
+      const renderShader = `
+struct VertexOut { @builtin(position) pos : vec4<f32>, @location(0) v_color : vec3<f32> };
+
+@vertex
+fn vs_main(@location(0) position : vec2<f32>) -> VertexOut {
+  var out : VertexOut;
+  out.pos = vec4<f32>(position, 0.0, 1.0);
+  // color a partir de posición para un look agradable
+  out.v_color = vec3<f32>(0.5 + position.x * 0.5, 0.6 - position.y * 0.3, 1.0 - length(position)*0.5);
+  return out;
+}
+
+@fragment
+fn fs_main(in : VertexOut) -> @location(0) vec4<f32> {
+  return vec4<f32>(in.v_color, 1.0);
+}
+`;
+
+      const renderModule = device.createShaderModule({ code: renderShader });
+
+      const pipeline = device.createRenderPipeline({
+        layout: 'auto',
+        vertex: {
+          module: renderModule,
+          entryPoint: 'vs_main',
+          buffers: [
+            {
+              arrayStride: 4 * 4, // vec4 per particle but we only use first vec2 as position
+              attributes: [
+                { shaderLocation: 0, offset: 0, format: 'float32x2' },
+                // velocity is present but not used for rendering
+              ]
+            }
+          ]
+        },
+        fragment: { module: renderModule, entryPoint: 'fs_main', targets: [{ format }] },
+        primitive: { topology: 'point-list' },
+        multisample: { count: 1 }
+      });
+
+      // Estado para animación
+      let last = performance.now();
+
+      // Resize handling
+      function resizeCanvas() {
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.floor(canvas.clientWidth * dpr);
+        canvas.height = Math.floor(canvas.clientHeight * dpr);
+      }
+      window.addEventListener('resize', resizeCanvas);
+      resizeCanvas();
+
+      // Mouse / touch
+      function updateMouseFromEvent(e, pressed) {
+        const rect = canvas.getBoundingClientRect();
+        const x = ((e.clientX ?? e.touches?.[0]?.clientX) - rect.left) / rect.width;
+        const y = ((e.clientY ?? e.touches?.[0]?.clientY) - rect.top) / rect.height;
+        // convertir a clip space -1..1 y corregir aspecto vertical
+        const cx = x * 2 - 1;
+        const cy = (1 - y) * 2 - 1;
+        mouse.x = cx;
+        mouse.y = cy;
+        mouse.pressed = pressed ? 1.0 : 0.0;
+      }
+
+      canvas.addEventListener('mousemove', (e) => updateMouseFromEvent(e, true));
+      canvas.addEventListener('mousedown', (e) => updateMouseFromEvent(e, true));
+      canvas.addEventListener('mouseup', () => mouse.pressed = 0.0);
+      canvas.addEventListener('mouseleave', () => mouse.pressed = 0.0);
+      canvas.addEventListener('touchstart', (e) => { updateMouseFromEvent(e, true); e.preventDefault(); });
+      canvas.addEventListener('touchmove', (e) => { updateMouseFromEvent(e, true); e.preventDefault(); });
+      canvas.addEventListener('touchend', () => mouse.pressed = 0.0);
+
+      function frame() {
+        const now = performance.now();
+        const dt = Math.min((now - last) / 1000, 0.04);
+        last = now;
+
+        // actualizar uniforms: mouse.x, mouse.y, dt, strength
+        // strength: si el ratón está pulsado -> repulsión fuerte (-0.5), si sólo sobrevuela -> atracción ligera (0.25)
+        const strength = mouse.pressed ? -0.5 : 0.25; // fuerza de interacción, cambiar para ver un poco la interaccion
+        const uniformData = new Float32Array([mouse.x, mouse.y, dt, strength]);
+        device.queue.writeBuffer(uniformBuffer, 0, uniformData.buffer, uniformData.byteOffset, uniformData.byteLength);
+
+        // Compute pass
+        const commandEncoder = device.createCommandEncoder();
+        const pass = commandEncoder.beginComputePass();
+        pass.setPipeline(computePipeline);
+        pass.setBindGroup(0, computeBindGroup);
+        const workgroupSize = 128;
+        const numGroups = Math.ceil(NUM / workgroupSize);
+        pass.dispatchWorkgroups(numGroups);
+        pass.end();
+
+        // Render pass
+        const textureView = context.getCurrentTexture().createView();
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [{ view: textureView, clearValue: { r: 0.03, g: 0.06, b: 0.12, a: 1 }, loadOp: 'clear', storeOp: 'store' }]
+        });
+        renderPass.setPipeline(pipeline);
+        renderPass.setVertexBuffer(0, particleBuffer);
+        renderPass.draw(NUM, 1, 0, 0);
+        renderPass.end();
+
+        device.queue.submit([commandEncoder.finish()]);
+
+        overlayCount.textContent = NUM;
+        requestAnimationFrame(frame);
+      }
+
+      requestAnimationFrame(frame);
+    }
+
+    init().catch(err => {
+      console.error(err);
+      document.body.insertAdjacentHTML('beforeend', '<div style="position:fixed;left:12px;bottom:12px;background:#300;color:#fff;padding:8px;border-radius:6px">Error inicializando WebGPU — mira la consola.</div>');
+    });
+  </script>
+</body>
+</html>
